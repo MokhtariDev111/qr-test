@@ -135,8 +135,13 @@ async def get_student_locations(session_id: int, db: AsyncSession = Depends(get_
                 "marked_at": a.marked_at,
                 "distance_meters": int(dist)
             })
-    return locations
-
+    
+    return {
+        "teacher_location_set": session.latitude is not None and session.longitude is not None,
+        "teacher_lat": session.latitude,
+        "teacher_lng": session.longitude,
+        "students": locations
+    }
 
 @router.post("/scan")
 async def scan(data: ScanRequest, db: AsyncSession = Depends(get_db), user: User = Depends(require_student)):
