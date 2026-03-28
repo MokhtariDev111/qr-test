@@ -119,6 +119,13 @@ async def get_student_locations(session_id: int, db: AsyncSession = Depends(get_
 
 @router.post("/scan")
 async def scan(data: ScanRequest, db: AsyncSession = Depends(get_db), user: User = Depends(require_student)):
+    # REQUIRE GPS - Student must enable location
+    if not data.latitude or not data.longitude:
+        raise HTTPException(400, "📍 Location required! Please enable GPS in your phone settings and try again.")
+    
+    if data.location_accuracy and data.location_accuracy > 500:
+        raise HTTPException(400, f"📍 GPS accuracy too poor ({int(data.location_accuracy)}m). Please enable precise GPS or go outside.")
+    
     parts = data.qr_token.split(":")
     if len(parts) != 2:
         raise HTTPException(400, "Invalid QR")
@@ -139,21 +146,15 @@ async def scan(data: ScanRequest, db: AsyncSession = Depends(get_db), user: User
     if session.qr_expires_at < datetime.utcnow() and (datetime.utcnow() - session.qr_expires_at).total_seconds() > 10:
         print(f"DEBUG: Token expired at {session.qr_expires_at}. Current time {datetime.utcnow()}")
         raise HTTPException(400, "QR code expired")
+    
     dist_val = None
-    # GPS Security check
+    # GPS Distance check - 15 meters limit
     if session.latitude and session.longitude and data.latitude and data.longitude:
-        # Reject if location accuracy is too poor (>500m means IP/cell tower fallback)
-        if data.location_accuracy and data.location_accuracy > 500:
-            print(f"DEBUG: Location accuracy too poor for {user.full_name}: {data.location_accuracy}m")
-            raise HTTPException(400, f"Location accuracy too poor ({int(data.location_accuracy)}m). Please enable GPS and try again.")
-        
         dist_val = calculate_distance(session.latitude, session.longitude, data.latitude, data.longitude)
-        print(f"DEBUG: Distance check for {user.full_name}: {dist_val:.1f} meters (accuracy: {data.location_accuracy}m)")
+        print(f"DEBUG: Distance check for {user.full_name}: {dist_val:.1f} meters")
         
-        # Dynamic tolerance: if high accuracy GPS, use strict 100m; if medium accuracy, use 200m
-        max_distance = 100 if (data.location_accuracy and data.location_accuracy < 50) else 200
-        if dist_val > max_distance:
-            raise HTTPException(400, f"Too far from classroom ({int(dist_val)}m away, max allowed: {max_distance}m)")
+        if dist_val > 15:
+            raise HTTPException(400, f"🚫 You are {int(dist_val)} meters away from the classroom. You must be within 15 meters to mark attendance.")
 
     # Anti-Multiple-Account (Fingerprint) check
     if data.device_id:
@@ -185,7 +186,7 @@ async def scan(data: ScanRequest, db: AsyncSession = Depends(get_db), user: User
     
     await db.commit()
     return {
-        "message": "Attendance marked successfully!", 
+        "message": "✅ Attendance marked successfully!", 
         "session_id": session_id,
         "distance_meters": int(dist_val) if dist_val is not None else None,
         "location_accuracy_meters": int(data.location_accuracy) if data.location_accuracy else None
