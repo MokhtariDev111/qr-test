@@ -11,7 +11,7 @@ import asyncio
 from app.core import get_db, settings, async_session
 from app.core.security import decode_token
 from app.models import User, Course, Enrollment, AttendanceSession, Attendance
-from app.schemas import SessionCreate, SessionResponse, QRResponse, ScanRequest
+from app.schemas import SessionCreate, SessionResponse, QRResponse, ScanRequest, TeacherLocationRequest
 from app.services import qr_service
 from app.api.routes.auth import get_current_user, require_teacher, require_student
 router = APIRouter(prefix="/attendance", tags=["Attendance"])
@@ -20,7 +20,7 @@ router = APIRouter(prefix="/attendance", tags=["Attendance"])
 def calculate_distance(lat1, lon1, lat2, lon2):
     """Haversine distance in meters"""
     if None in [lat1, lon1, lat2, lon2]: return 0
-    R = 6371000 # Radius of earth in meters
+    R = 6371000
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
@@ -40,13 +40,35 @@ async def create_session(data: SessionCreate, db: AsyncSession = Depends(get_db)
         teacher_id=user.id, 
         qr_token=token, 
         qr_expires_at=qr_service.get_qr_expiry(),
-        latitude=data.latitude,
-        longitude=data.longitude
+        latitude=None,
+        longitude=None
     )
     db.add(session)
     await db.commit()
     await db.refresh(session)
     return session
+
+
+@router.post("/sessions/{session_id}/set-location")
+async def set_teacher_location(session_id: int, data: TeacherLocationRequest, db: AsyncSession = Depends(get_db), user: User = Depends(require_teacher)):
+    """Teacher scans QR on phone to set accurate GPS location"""
+    result = await db.execute(select(AttendanceSession).where(
+        AttendanceSession.id == session_id, 
+        AttendanceSession.teacher_id == user.id,
+        AttendanceSession.is_active == True
+    ))
+    session = result.scalar_one_or_none()
+    if not session:
+        raise HTTPException(404, "Session not found")
+    
+    if not data.latitude or not data.longitude:
+        raise HTTPException(400, "Location required! Please enable GPS.")
+    
+    session.latitude = data.latitude
+    session.longitude = data.longitude
+    await db.commit()
+    
+    return {"message": "Classroom location set!", "latitude": data.latitude, "longitude": data.longitude}
 
 
 @router.get("/sessions/{session_id}/qr", response_model=QRResponse)
@@ -87,7 +109,6 @@ async def get_records(session_id: int, db: AsyncSession = Depends(get_db), user:
 @router.get("/sessions/{session_id}/locations")
 async def get_student_locations(session_id: int, db: AsyncSession = Depends(get_db), user: User = Depends(require_teacher)):
     """Get GPS locations of all students who scanned in this session."""
-    # First get the session to know the teacher's location
     result_session = await db.execute(select(AttendanceSession).where(AttendanceSession.id == session_id))
     session = result_session.scalar_one_or_none()
     if not session:
@@ -142,10 +163,13 @@ async def scan(data: ScanRequest, db: AsyncSession = Depends(get_db), user: User
         print(f"DEBUG: Token mismatch. Expected {session.qr_token[:10]}... or {session.last_qr_token[:10] if session.last_qr_token else 'None'}... got {token[:10]}...")
         raise HTTPException(400, "Invalid QR code (it may have just refreshed)")
 
-    # Add a 10s grace period for slightly sluggish networks
     if session.qr_expires_at < datetime.utcnow() and (datetime.utcnow() - session.qr_expires_at).total_seconds() > 10:
         print(f"DEBUG: Token expired at {session.qr_expires_at}. Current time {datetime.utcnow()}")
         raise HTTPException(400, "QR code expired")
+    
+    # Check if teacher has set location
+    if not session.latitude or not session.longitude:
+        raise HTTPException(400, "⏳ Teacher hasn't set classroom location yet. Please wait.")
     
     dist_val = None
     # GPS Distance check - 15 meters limit
@@ -164,7 +188,6 @@ async def scan(data: ScanRequest, db: AsyncSession = Depends(get_db), user: User
 
     result = await db.execute(select(Enrollment).where(Enrollment.course_id == session.course_id, Enrollment.student_id == user.id))
     if not result.scalar_one_or_none():
-        # Auto-enroll student smoothly if they scan a valid session QR
         db.add(Enrollment(course_id=session.course_id, student_id=user.id))
         await db.flush()
     result = await db.execute(select(Attendance).where(Attendance.session_id == session_id, Attendance.student_id == user.id))
@@ -175,7 +198,6 @@ async def scan(data: ScanRequest, db: AsyncSession = Depends(get_db), user: User
         att = Attendance(session_id=session_id, student_id=user.id)
         db.add(att)
     
-    # Instant marking (security provided by QR rotation + GPS geofence + Device Lock)
     att.qr_verified = True
     att.is_present = True
     att.latitude = data.latitude
@@ -195,7 +217,6 @@ async def scan(data: ScanRequest, db: AsyncSession = Depends(get_db), user: User
 
 @router.get("/sessions/{session_id}/report")
 async def export_report(session_id: int, token: Optional[str] = None, db: AsyncSession = Depends(get_db)):
-    # Authenticate (if via window.open, token is in query)
     current_user = None
     if token:
         payload = decode_token(token)
@@ -206,17 +227,14 @@ async def export_report(session_id: int, token: Optional[str] = None, db: AsyncS
     if not current_user or current_user.role != "teacher":
         raise HTTPException(403, "Access denied")
 
-    # 1. Fetch session and course
     res = await db.execute(select(AttendanceSession, Course).join(Course, Course.id == AttendanceSession.course_id).where(AttendanceSession.id == session_id, AttendanceSession.teacher_id == current_user.id))
     entry = res.one_or_none()
     if not entry: raise HTTPException(404, "Session not found")
     session, course = entry
     
-    # 2. Fetch present students
     attendees_res = await db.execute(select(Attendance, User).join(User, Attendance.student_id == User.id).where(Attendance.session_id == session_id, Attendance.is_present == True))
     attendees = attendees_res.all()
     
-    # 3. Create PDF
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", "B", 20)
@@ -228,14 +246,12 @@ async def export_report(session_id: int, token: Optional[str] = None, db: AsyncS
     pdf.cell(0, 10, f"Total Present: {len(attendees)}", ln=True)
     pdf.ln(10)
     
-    # Table header
     pdf.set_font("Arial", "B", 12)
     pdf.cell(40, 10, "Student ID", 1)
     pdf.cell(80, 10, "Name", 1)
     pdf.cell(60, 10, "Time Marked", 1)
     pdf.ln()
     
-    # Table data
     pdf.set_font("Arial", "", 11)
     for att, u in attendees:
         pdf.cell(40, 10, str(u.student_id or "N/A"), 1)

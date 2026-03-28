@@ -80,5 +80,7 @@ class ScanRequest(BaseModel):
     location_accuracy: Optional[float] = None  # GPS accuracy in meters
     device_id: Optional[str] = None
 
-
+class TeacherLocationRequest(BaseModel):
+    latitude: float
+    longitude: float
 
